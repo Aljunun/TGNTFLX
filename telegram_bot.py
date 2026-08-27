@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from core import parse_account_line, process_account
+from nftoken_core import parse_account_line, process_account
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
