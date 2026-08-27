@@ -7,7 +7,10 @@ from contextlib import asynccontextmanager
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from nftoken_core import parse_account_line, process_account
+try:
+    from core import parse_account_line, process_account
+except ImportError:
+    from nftoken_core import parse_account_line, process_account
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -91,6 +94,44 @@ def _process_lines(lines: list[str]) -> list[dict]:
     return results
 
 
+def _process_input(text: str) -> list[dict]:
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not lines:
+        lines = [text.strip()]
+    return _process_lines(lines)
+
+
+def _results_to_json(results: list[dict]) -> dict:
+    items = []
+    for index, result in enumerate(results, start=1):
+        items.append(
+            {
+                "index": index,
+                "email": result.get("email") or "",
+                "status": result["status"],
+                "login_url": result.get("login_url"),
+                "expiry": result.get("expiry_str"),
+                "error": result.get("error"),
+            }
+        )
+    return {
+        "success": any(item["status"] == "SUCCESS" for item in items),
+        "count": len(items),
+        "results": items,
+    }
+
+
+def _check_api_key(provided_key: str | None) -> bool:
+    required = os.environ.get("API_KEY", "").strip()
+    if not required:
+        return True
+    return provided_key == required
+
+
 def _format_results(results: list[dict]) -> str:
     if not results:
         return "❌ Could not parse any valid cookie input.\n\nMake sure NetflixId is included."
@@ -167,12 +208,29 @@ def run_polling(token: str) -> None:
     application.run_polling(drop_pending_updates=True)
 
 
+def get_cors_origins() -> list[str]:
+    raw = os.environ.get("CORS_ORIGINS", "").strip()
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "https://netfdel.com",
+        "https://www.netfdel.com",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
 def run_webhook_server(token: str) -> None:
     import uvicorn
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, Header, HTTPException, Query, Request
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, Field
 
     global ptb_application
+
+    class GenerateRequest(BaseModel):
+        cookies: str = Field(..., min_length=1)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -197,11 +255,59 @@ def run_webhook_server(token: str) -> None:
         await ptb_application.stop()
         await ptb_application.shutdown()
 
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(title=BOT_NAME, lifespan=lifespan)
+    cors_origins = get_cors_origins()
+    logger.info("CORS allowed origins: %s", cors_origins)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    async def run_generate(cookies: str) -> dict:
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, _process_input, cookies)
+        if not results:
+            raise HTTPException(status_code=400, detail="Could not parse cookies. Include NetflixId=...")
+        return _results_to_json(results)
 
     @app.get("/")
     async def health():
-        return JSONResponse({"status": "ok", "bot": BOT_NAME})
+        return JSONResponse({
+            "status": "ok",
+            "bot": BOT_NAME,
+            "api": {
+                "get": "/api/generate?cookies=YOUR_COOKIES",
+                "post": "/api/generate",
+            },
+        })
+
+    @app.get("/api/generate")
+    async def api_generate_get(
+        cookies: str | None = Query(None, description="Netflix cookie string"),
+        input: str | None = Query(None, alias="input", description="Alias for cookies"),
+        api_key: str | None = Query(None, alias="api_key"),
+        x_api_key: str | None = Header(None, alias="X-API-Key"),
+    ):
+        if not _check_api_key(api_key or x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        cookie_text = cookies or input
+        if not cookie_text or not cookie_text.strip():
+            raise HTTPException(status_code=400, detail="Missing cookies query parameter")
+        return await run_generate(cookie_text.strip())
+
+    @app.post("/api/generate")
+    async def api_generate_post(
+        body: GenerateRequest,
+        api_key: str | None = Query(None, alias="api_key"),
+        x_api_key: str | None = Header(None, alias="X-API-Key"),
+    ):
+        if not _check_api_key(api_key or x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return await run_generate(body.cookies.strip())
 
     @app.post(WEBHOOK_PATH)
     async def telegram_webhook(request: Request):
@@ -214,7 +320,7 @@ def run_webhook_server(token: str) -> None:
         return JSONResponse({"ok": True})
 
     port = int(os.environ.get("PORT", "10000"))
-    logger.info("Starting %s webhook server on port %s...", BOT_NAME, port)
+    logger.info("Starting %s webhook + API server on port %s...", BOT_NAME, port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
