@@ -1,12 +1,15 @@
 services:
-  - type: worker
+  - type: web
     name: netflix-nftoken-telegram-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python telegram_bot.py
+    healthCheckPath: /
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: BOT_MODE
+        value: webhook
       - key: PYTHON_VERSION
         value: "3.11.9"
