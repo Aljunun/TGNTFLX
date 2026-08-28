@@ -11,5 +11,7 @@ services:
         sync: false
       - key: BOT_MODE
         value: webhook
+      - key: CORS_ORIGINS
+        value: https://netfdel.com,https://www.netfdel.com
       - key: PYTHON_VERSION
         value: "3.11.9"

@@ -220,6 +220,107 @@ def get_cors_origins() -> list[str]:
     ]
 
 
+def get_firebase_db_url() -> str:
+    return os.environ.get(
+        "FIREBASE_DATABASE_URL",
+        "https://astro-782c4-default-rtdb.firebaseio.com",
+    ).rstrip("/")
+
+
+def fetch_rtdb(path: str):
+    import requests as req
+
+    url = f"{get_firebase_db_url()}/{path.lstrip('/')}.json"
+    try:
+        response = req.get(url, timeout=15)
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception as exc:
+        logger.warning("Firebase fetch failed for %s: %s", path, exc)
+        return None
+
+
+def get_env_fallback_accounts() -> list[str]:
+    raw = os.environ.get("FALLBACK_ACCOUNTS", "").strip()
+    if not raw:
+        return []
+    return [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def collect_redeem_candidates(code: str) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def add_account(data: str) -> None:
+        cleaned = (data or "").strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    voucher = fetch_rtdb(f"vouchers/{code.strip().upper()}")
+    if isinstance(voucher, dict):
+        add_account(voucher.get("data", ""))
+
+    pool = fetch_rtdb("accountPool")
+    if isinstance(pool, dict):
+        for entry in pool.values():
+            if isinstance(entry, dict):
+                add_account(entry.get("data", ""))
+
+    for line in get_env_fallback_accounts():
+        add_account(line)
+
+    return candidates
+
+
+def extract_nftoken(login_url_or_token: str) -> str:
+    value = (login_url_or_token or "").strip()
+    marker = "nftoken="
+    idx = value.find(marker)
+    if idx != -1:
+        return value[idx + len(marker) :]
+    return value
+
+
+DEVICE_PREFIXES = {
+    "pc": "https://www.netflix.com/account?nftoken=",
+    "phone": "https://www.netflix.com/unsupported?nftoken=",
+    "tv": "https://www.netflix.com/tv9?nftoken=",
+}
+
+
+def build_device_link(login_url_or_token: str, device: str = "pc") -> str:
+    token = extract_nftoken(login_url_or_token)
+    if not token:
+        return ""
+    prefix = DEVICE_PREFIXES.get(device, DEVICE_PREFIXES["pc"])
+    return prefix + token
+
+
+def redeem_first_success(candidates: list[str]) -> dict | None:
+    import random
+
+    if not candidates:
+        return None
+
+    primary = candidates[0]
+    rest = candidates[1:]
+    random.shuffle(rest)
+    ordered = [primary, *rest]
+
+    for cookies in ordered:
+        results = _process_input(cookies)
+        for result in results:
+            if result.get("status") == "SUCCESS" and result.get("login_url"):
+                return result
+    return None
+
+
 def run_webhook_server(token: str) -> None:
     import uvicorn
     from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -231,6 +332,10 @@ def run_webhook_server(token: str) -> None:
 
     class GenerateRequest(BaseModel):
         cookies: str = Field(..., min_length=1)
+
+    class RedeemRequest(BaseModel):
+        code: str = Field(..., min_length=1)
+        device: str = Field(default="pc")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -281,6 +386,7 @@ def run_webhook_server(token: str) -> None:
             "api": {
                 "get": "/api/generate?cookies=YOUR_COOKIES",
                 "post": "/api/generate",
+                "redeem": "/api/redeem",
             },
         })
 
@@ -308,6 +414,39 @@ def run_webhook_server(token: str) -> None:
         if not _check_api_key(api_key or x_api_key):
             raise HTTPException(status_code=401, detail="Invalid API key")
         return await run_generate(body.cookies.strip())
+
+    @app.post("/api/redeem")
+    async def api_redeem_post(
+        body: RedeemRequest,
+        api_key: str | None = Query(None, alias="api_key"),
+        x_api_key: str | None = Header(None, alias="X-API-Key"),
+    ):
+        if not _check_api_key(api_key or x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        loop = asyncio.get_running_loop()
+        candidates = await loop.run_in_executor(None, collect_redeem_candidates, body.code)
+        if not candidates:
+            raise HTTPException(status_code=404, detail="Invalid voucher code")
+
+        result = await loop.run_in_executor(None, redeem_first_success, candidates)
+        if not result:
+            raise HTTPException(status_code=503, detail="No working account available")
+
+        device = body.device if body.device in DEVICE_PREFIXES else "pc"
+        login_url = build_device_link(result["login_url"], device)
+        if not login_url:
+            raise HTTPException(status_code=503, detail="No working account available")
+
+        return JSONResponse(
+            {
+                "success": True,
+                "login_url": login_url,
+                "expiry": result.get("expiry_str"),
+                "device": device,
+                "attempted": len(candidates),
+            }
+        )
 
     @app.post(WEBHOOK_PATH)
     async def telegram_webhook(request: Request):
